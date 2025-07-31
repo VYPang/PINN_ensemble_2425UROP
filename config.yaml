@@ -1,0 +1,6 @@
+batch_size: 'all' # 'all'
+lr : 0.001
+momentum: 0.5
+epochs: 100000
+val_split: 0.2
+weight_decay: 0.0001

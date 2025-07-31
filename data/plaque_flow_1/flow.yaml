@@ -1,0 +1,5 @@
+viscosity: 0.004          # Pa.s
+density: 1060             # kg/m^3
+char_length: 0.003        # m
+inlet_avg_velocity: 0.667 # m/s
+inlet_length: 0.003       # m
