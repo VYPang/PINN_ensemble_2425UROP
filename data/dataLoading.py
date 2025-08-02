@@ -12,14 +12,33 @@ class collocation:
 
 # Intake point_cloud should be a 
 class pointCloudDataset(Dataset):
-    def __init__(self, point_cloud, device, conf):
-        self.point_cloud = point_cloud
-        self.device = device
-        self.conf = conf
-        self.data = self.load_data()
+    def __init__(self, coords, known_values, point_types):
+        # Store data on CPU for DataLoader compatibility
+        self.coords = torch.tensor(coords, dtype=torch.float32)
+        self.known_values = torch.tensor(known_values, dtype=torch.float32)
+        self.point_types = point_types
     
     def __len__(self):
-        return len(self.data)
+        return len(self.coords)
+    
+    def __getitem__(self, idx):
+        return self.coords[idx], self.known_values[idx], self.point_types[idx]
+
+class pointCloudCollection:
+    def __init__(self, point_cloud, device):
+        coords, point_types, known_values, ground_truth = point_cloud
+        
+        # Convert to numpy if pandas
+        if hasattr(coords, 'values'):
+            coords = coords.values
+        if hasattr(known_values, 'values'):
+            known_values = known_values.values
+        if hasattr(ground_truth, 'values'):
+            ground_truth = ground_truth.values
+            
+        # Dataset stores data on CPU, GPU transfer happens in DataLoader
+        self.init_dataset = pointCloudDataset(coords, known_values, point_types)
+        self.ground_truth = torch.tensor(ground_truth, dtype=torch.float32, device=device)
     
 
     

@@ -9,8 +9,10 @@ from omegaconf import OmegaConf
 import numpy as np
 import os
 
-def train(savePath, device, loss_fn, conf, trainLoader, model, valLoader=None, saveModel=True):
+def train(savePath, device, loss_fn, conf, trainLoader, model, optimizer, valLoader=None, saveModel=True):
     epochs = conf.epochs
+    scaler = torch.cuda.amp.GradScaler()  # For mixed precision training
+    
     for epoch in range(epochs):
         train_tqdm = tqdm(trainLoader, total=len(trainLoader))
         for batch_idx, batch in enumerate(train_tqdm):
@@ -19,17 +21,23 @@ def train(savePath, device, loss_fn, conf, trainLoader, model, valLoader=None, s
             optimizer.zero_grad()
 
             coords, known, point_type = batch
+            coords = coords.to(device, non_blocking=True)
+            known = known.to(device, non_blocking=True)
             coords.requires_grad_(True)
-            pred = model(coords)
+            
+            # Use mixed precision for faster training
+            with torch.cuda.amp.autocast():
+                pred = model(coords)
+                total_residual, residual_message_dict = model.residual(coords, pred)
+                total_loss, loss_message_dict = loss_fn.compute(pred, known)
+                loss = total_loss + total_residual
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            total_residual, residual_message_dict = model.residual(coords, pred) # residual loss
-            total_loss, loss_message_dict = loss_fn.compute(pred, known) # known loss
-            loss = total_loss + total_residual
-            loss.backward()
-            optimizer.step()
-
-            if epoch % 50 == 0: # print loss message
-                message = ''
+            if epoch % 50 == 0 and batch_idx == 0:  # print loss message once per epoch
+                message = f'Epoch {epoch}: '
                 if residual_message_dict:
                     for key, value in residual_message_dict.items():
                         message += f'{key}: {value:.4f} '
@@ -38,17 +46,38 @@ def train(savePath, device, loss_fn, conf, trainLoader, model, valLoader=None, s
                         message += f'{key}: {value:.4f} '
                 if len(message) > 0:
                     print(message)
+                    
     if saveModel:
         torch.save(model.state_dict(), savePath + f'/final.pt')
     else:
         return model
 
-def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath):
+def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device):
     print('Initial training')
     init_dataset = point_cloud_collection.init_dataset
-    batch_size = conf.batch_size if conf.batch_size != 'all' else len(init_dataset.coords)
-    init_loader = DataLoader(init_dataset, batch_size=batch_size, shuffle=True)
-    init_model = train(savePath, device, loss_fn, conf, init_loader, model, saveModel=False)
+    batch_size = conf.batch_size if conf.batch_size != 'all' else len(init_dataset)
+    
+    # Get configuration values with defaults
+    num_workers = getattr(conf, 'num_workers', 0)
+    pin_memory = getattr(conf, 'pin_memory', False)
+    
+    # Configure DataLoader based on num_workers
+    dataloader_kwargs = {
+        'batch_size': batch_size,
+        'shuffle': True,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory
+    }
+    
+    # Only add multiprocessing-specific options if num_workers > 0
+    if num_workers > 0:
+        dataloader_kwargs['prefetch_factor'] = getattr(conf, 'prefetch_factor', 2)
+        dataloader_kwargs['persistent_workers'] = True
+    
+    init_loader = DataLoader(init_dataset, **dataloader_kwargs)
+    
+    init_model = train(savePath, device, loss_fn, conf, init_loader, model, optimizer, saveModel=False)
+    return init_model
 
 if __name__ == '__main__':
     flow_prop = OmegaConf.load('data/plaque_flow_1/flow.yaml')
@@ -73,4 +102,10 @@ if __name__ == '__main__':
     model = flow_model(reynolds_number=re).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)
     loss_fn = flow_loss(loss_fn=nn.MSELoss())
-    votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath)
+    
+    # Enable optimizations
+    torch.backends.cudnn.benchmark = True  # Optimize CUDNN for consistent input sizes
+    torch.backends.cuda.matmul.allow_tf32 = True  # Use TF32 for faster matrix operations
+    torch.backends.cudnn.allow_tf32 = True
+    
+    votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device)
