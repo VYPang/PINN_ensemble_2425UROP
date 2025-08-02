@@ -52,7 +52,7 @@ def train(savePath, device, loss_fn, conf, trainLoader, model, optimizer, valLoa
     else:
         return model
 
-def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device):
+def init_training(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device):
     print('Initial training')
     init_dataset = point_cloud_collection.init_dataset
     batch_size = conf.batch_size if conf.batch_size != 'all' else len(init_dataset)
@@ -79,18 +79,58 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
     init_model = train(savePath, device, loss_fn, conf, init_loader, model, optimizer, saveModel=False)
     return init_model
 
+def infer(model, infer_loader, device):
+    model.eval()
+    infer_tqdm = tqdm(infer_loader, total=len(infer_loader))
+    all_preds = []
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(infer_tqdm):
+            coords, _, _ = batch
+            coords = coords.to(device, non_blocking=True)
+            coords.requires_grad_(True)
+            
+            pred = model(coords)
+            all_preds.append(pred.cpu().numpy())
+    all_preds = np.concatenate(all_preds, axis=0)
+    return all_preds
+
+def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, adaptive_method_list):
+    # Initial training: provide pseudo-labels & initial model
+    init_model = init_training(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device)
+
+    # Pseudo-label of interior points
+    init_interior_dataset, init_interior_idx = point_cloud_collection.init_dataset.get_interior_dataset()
+    init_infer_loader = DataLoader(init_interior_dataset)
+    pseudo_labels = infer(init_model, init_infer_loader, device)
+    point_cloud_collection.init_dataset.save_pseudo_labels(pseudo_labels, init_interior_idx)
+
+    # Adaptive sampling loop
+    point_cloud_collection.add_branch_dataset(adaptive_method_list)
+
 if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ######### USER INPUT #########
+    # Load point cloud & loss function (point_cloud & loss_fn)
     flow_prop = OmegaConf.load('data/plaque_flow_1/flow.yaml')
     re = flow_prop.density * flow_prop.inlet_avg_velocity * flow_prop.char_length / flow_prop.viscosity
     point_cloud_path = 'data/plaque_flow_1/point_cloud.xlsx'
     cfd_results_path = 'data/plaque_flow_1/cfd_results.csv'
+    from data.plaque_flow import preprocessing, flow_loss
+    point_cloud_dict, point_cloud, cfd_results = preprocessing(point_cloud_path, cfd_results_path, flow_prop.char_length)
+    loss_fn = flow_loss(loss_fn=nn.MSELoss())
+
+    # Select model (model)
+    from model.flow_model import flow_model
+    model = flow_model(reynolds_number=re)
+
+    # Read configuration (conf)
     config_path = 'config.yaml'
     conf = OmegaConf.load(config_path)
 
-    from model.flow_model import flow_model
-    from data.plaque_flow import preprocessing, flow_loss
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    point_cloud_dict, point_cloud, cfd_results = preprocessing(point_cloud_path, cfd_results_path, flow_prop.char_length)
+    # Define adaptive sampling methods (adaptive_method_list)
+    adaptive_method_list = ['random', 'uncertainty', 'gradient', 'residual']
+    ######### USER INPUT END #########
+
     point_cloud_collection = pointCloudCollection(point_cloud, device)
 
     # create checkpoint folder
@@ -99,13 +139,12 @@ if __name__ == '__main__':
     savePath = f'ckpt/{file_name}'
     os.makedirs(savePath)
 
-    model = flow_model(reynolds_number=re).to(device)
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)
-    loss_fn = flow_loss(loss_fn=nn.MSELoss())
     
     # Enable optimizations
     torch.backends.cudnn.benchmark = True  # Optimize CUDNN for consistent input sizes
     torch.backends.cuda.matmul.allow_tf32 = True  # Use TF32 for faster matrix operations
     torch.backends.cudnn.allow_tf32 = True
     
-    votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device)
+    votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, adaptive_method_list)

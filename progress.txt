@@ -1,0 +1,3 @@
+Moving on: random adding collocation
+    - ensure within domain
+    - config no. of collocation
