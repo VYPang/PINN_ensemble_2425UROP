@@ -8,10 +8,32 @@ import datetime
 from omegaconf import OmegaConf
 import numpy as np
 import os
+import copy
 
-def train(savePath, device, loss_fn, conf, trainLoader, model, optimizer, valLoader=None, saveModel=True):
+def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=None, saveModel=True, adaptive_sampling_method=None):
     epochs = conf.epochs
     scaler = torch.cuda.amp.GradScaler()  # For mixed precision training
+
+    batch_size = conf.batch_size if conf.batch_size != 'all' else len(dataset)
+
+    # Get configuration values with defaults
+    num_workers = getattr(conf, 'num_workers', 0)
+    pin_memory = getattr(conf, 'pin_memory', False)
+    
+    # Configure DataLoader based on num_workers
+    dataloader_kwargs = {
+        'batch_size': batch_size,
+        'shuffle': True,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory
+    }
+    
+    # Only add multiprocessing-specific options if num_workers > 0
+    if num_workers > 0:
+        dataloader_kwargs['prefetch_factor'] = getattr(conf, 'prefetch_factor', 2)
+        dataloader_kwargs['persistent_workers'] = True
+    
+    trainLoader = DataLoader(dataset, **dataloader_kwargs)
     
     for epoch in range(epochs):
         train_tqdm = tqdm(trainLoader, total=len(trainLoader))
@@ -46,38 +68,18 @@ def train(savePath, device, loss_fn, conf, trainLoader, model, optimizer, valLoa
                         message += f'{key}: {value:.4f} '
                 if len(message) > 0:
                     print(message)
+        
+        # Adaptive sampling step
+        if adaptive_sampling_method:
+            interval = conf.adaptive_sampling.sampling_interval
+            if (epoch + 1) % interval == 0:
+                print(adaptive_sampling_method)
+                updated_points, removed_points = adaptive_sampling_method.sample(total_residual, dataset)
                     
     if saveModel:
         torch.save(model.state_dict(), savePath + f'/final.pt')
     else:
         return model
-
-def init_training(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device):
-    print('Initial training')
-    init_dataset = point_cloud_collection.init_dataset
-    batch_size = conf.batch_size if conf.batch_size != 'all' else len(init_dataset)
-    
-    # Get configuration values with defaults
-    num_workers = getattr(conf, 'num_workers', 0)
-    pin_memory = getattr(conf, 'pin_memory', False)
-    
-    # Configure DataLoader based on num_workers
-    dataloader_kwargs = {
-        'batch_size': batch_size,
-        'shuffle': True,
-        'num_workers': num_workers,
-        'pin_memory': pin_memory
-    }
-    
-    # Only add multiprocessing-specific options if num_workers > 0
-    if num_workers > 0:
-        dataloader_kwargs['prefetch_factor'] = getattr(conf, 'prefetch_factor', 2)
-        dataloader_kwargs['persistent_workers'] = True
-    
-    init_loader = DataLoader(init_dataset, **dataloader_kwargs)
-    
-    init_model = train(savePath, device, loss_fn, conf, init_loader, model, optimizer, saveModel=False)
-    return init_model
 
 def infer(model, infer_loader, device):
     model.eval()
@@ -95,10 +97,16 @@ def infer(model, infer_loader, device):
     return all_preds
 
 def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, adaptive_method_list):
+    # Create an independent copy of the original model
+    og_model = copy.deepcopy(model)
+    
     # Initial training: provide pseudo-labels & initial model
-    init_model = init_training(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device)
+    print('Initial training')
+    init_dataset = point_cloud_collection.init_dataset
+    init_model = train(savePath, device, loss_fn, conf, init_dataset, model, optimizer, saveModel=False)
 
     # Pseudo-label of interior points
+    print('Infer & Pseudo-labeling initial interior points')
     init_interior_dataset, init_interior_idx = point_cloud_collection.init_dataset.get_interior_dataset()
     init_infer_loader = DataLoader(init_interior_dataset)
     pseudo_labels = infer(init_model, init_infer_loader, device)
@@ -106,6 +114,13 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
 
     # Adaptive sampling loop
     point_cloud_collection.add_branch_dataset(adaptive_method_list)
+    point_cloud_collection.add_random_interior_collocation_to_branch_datasets(conf.adaptive_sampling.add_random_interior_collocation)
+    point_cloud_collection.add_branch_model(og_model, init_model)
+    for i in range(len(adaptive_method_list)):
+        print(adaptive_method_list[i])
+        branch_dataset = point_cloud_collection.branch_dataset[i]
+        branch_model = point_cloud_collection.branch_model[i]
+        branch_model = train(savePath, device, loss_fn, conf, branch_dataset, branch_model, optimizer, saveModel=False, adaptive_sampling_method=adaptive_method_list[i])
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -128,10 +143,11 @@ if __name__ == '__main__':
     conf = OmegaConf.load(config_path)
 
     # Define adaptive sampling methods (adaptive_method_list)
-    adaptive_method_list = ['random', 'uncertainty', 'gradient', 'residual']
+    from util.evo_sampling import evolutionary_sampling
+    adaptive_method_list = [evolutionary_sampling, 'uncertainty', 'gradient', 'residual']
     ######### USER INPUT END #########
 
-    point_cloud_collection = pointCloudCollection(point_cloud, device)
+    point_cloud_collection = pointCloudCollection(point_cloud, conf, device)
 
     # create checkpoint folder
     current_time = datetime.datetime.now()

@@ -6,6 +6,7 @@ import random
 import matplotlib.path as mplpath
 from scipy.spatial import ConvexHull
 from shapely.geometry import Point, Polygon
+import copy
 
 class collocation:
     def __init__(self, coord, point_type, label):
@@ -121,8 +122,7 @@ class pointCloudDataset(Dataset):
                 if len(new_interior_coords) >= num_points:
                     break
                     
-                point_shapely = Point(x, y)
-                if boundary_polygon_shapely.contains(point_shapely):
+                if self.check_inside_boundary(x, y):
                     new_interior_coords.append([x, y])
         
         # Add the points to the dataset (same as previous method)
@@ -177,6 +177,15 @@ class pointCloudDataset(Dataset):
     def __getitem__(self, idx):
         return self.coords[idx], self.known_values[idx], self.point_types[idx]
 
+    def check_inside_boundary(self, x, y): # Check if a point (x, y) is inside the domain boundary.
+        if not hasattr(self, 'domain_path') or self.domain_path is None:
+            raise ValueError("Domain boundary not defined. Cannot check point location.")
+        
+        # Use Shapely for more robust point-in-polygon testing
+        boundary_polygon_shapely = Polygon(self.boundary_polygon)
+        point_shapely = Point(x, y)
+        return boundary_polygon_shapely.contains(point_shapely)
+
 class interiorDataset(pointCloudDataset):
     def __init__(self, coords, known_values, point_types):
         super().__init__(coords, known_values, point_types)
@@ -218,17 +227,26 @@ class pointCloudCollection:
                 dataset_name=f'branch_{method}'
             )
             self.branch_dataset.append(branch_dataset)
-    
-    def add_random_interiorCollocation_all_datasets(self):
-        add_random_interior_collocation = self.conf.add_random_interior_collocation
+
+    def add_random_interior_collocation_to_branch_datasets(self, num_points):
+        add_random_interior_collocation = self.conf.adaptive_sampling.add_random_interior_collocation
         if add_random_interior_collocation:
             # add to init dataset
-            num_points = self.conf.num_interior_collocation_points
             self.init_dataset.add_random_interior_collocation(num_points)
             # add to branch datasets
             for branch in self.branch_dataset:
                 branch.add_random_interior_collocation(num_points)
     
+    def add_branch_model(self, original_model, initial_model):
+        self.branch_model = []
+        for method in self.branch_dataset:
+            if self.conf.adaptive_sampling.initiate_new_model:
+                # Create an independent copy of the original model
+                self.branch_model.append(copy.deepcopy(original_model))
+            else:
+                # Create an independent copy of the initial model
+                self.branch_model.append(copy.deepcopy(initial_model))
+
 if __name__ == '__main__':
     from omegaconf import OmegaConf
     from plaque_flow import preprocessing
