@@ -51,9 +51,15 @@ class flow_model(MLP):
         momentum_residual_x = u*dudx + v*dudy + dpdx - (1/self.re)*(d2udx2 + d2udy2)
         momentum_residual_y = u*dvdx + v*dvdy + dpdy - (1/self.re)*(d2vdx2 + d2vdy2)
         
-        mass_residual = torch.mean(mass_residual**2)
-        momentum_residual_x = torch.mean(momentum_residual_x**2)
-        momentum_residual_y = torch.mean(momentum_residual_y**2)
+        mass_residual = mass_residual**2
+        momentum_residual_x = momentum_residual_x**2
+        momentum_residual_y = momentum_residual_y**2
+
+        collocation_residual = mass_residual + momentum_residual_x + momentum_residual_y
+
+        mass_residual = torch.mean(mass_residual)
+        momentum_residual_x = torch.mean(momentum_residual_x)
+        momentum_residual_y = torch.mean(momentum_residual_y)
 
         total_residual = mass_residual + momentum_residual_x + momentum_residual_y
         message_dict = {
@@ -61,7 +67,7 @@ class flow_model(MLP):
             'momentum_residual_x': momentum_residual_x.item(),
             'momentum_residual_y': momentum_residual_y.item()
         }
-        return total_residual, message_dict
+        return total_residual, collocation_residual, message_dict
 
 if __name__ == '__main__':
     model = flow_model(reynolds_number=1000)

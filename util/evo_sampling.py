@@ -3,9 +3,9 @@ from omegaconf import OmegaConf
 
 class evolutionary_sampling:
     def __init__(self):
-        self.conf =  OmegaConf.load('evo_sampling_conf.yaml')
+        self.conf =  OmegaConf.load('util/evo_sampling_conf.yaml')
 
-    def __print__(self):
+    def print(self):
         print("Adaptive sampling method: evolutionary_sampling.")
 
     def sample(self, residuals, collocation_dataset):
@@ -20,7 +20,8 @@ class evolutionary_sampling:
         - new_points: Updated population P_{i+1} of size N_r (identical to original number of points).
         """
         N_r = len(collocation_dataset.interior_dataset) # current interior points
-        current_points = collocation_dataset.interior_dataset.coords
+        current_points = collocation_dataset.interior_dataset.coords.numpy()  # NxD array of current collocation points
+        _, current_idx = collocation_dataset.get_interior_dataset()
         
         # Step 3: Compute fitness F(x_r) = |R(x_r)| for each x_r in P_i
         residuals = np.abs(residuals)
@@ -31,6 +32,7 @@ class evolutionary_sampling:
         # Step 5: Select retained population P_r^i where F > tau_i
         retain_mask = residuals > tau_i
         retained_points = current_points[retain_mask]
+        retained_idx = current_idx[retain_mask]
         
         # Minimum retain proportion
         min_retain_proportion = self.conf.min_retain_proportion
@@ -40,17 +42,20 @@ class evolutionary_sampling:
                 # If not enough points retained, keep at least min_retain_count
                 sorted_idx = np.argsort(-residuals[retain_mask])[:min_retain_count]
                 retained_points = retained_points[sorted_idx]
-        
-        # Compute number of new points to sample
-        num_new = N_r - len(retained_points)
-        
-        # Step 6: Generate re-sampled population P_s^i ~ U(Ω), size num_new
+                retained_idx = retained_idx[sorted_idx]
+
+        # remove removed_points from collocation_dataset
+        removed_idx = np.setdiff1d(current_idx, retained_idx)
+        collocation_dataset.remove_interior_dataset(removed_idx)
+
+        # Note that add_random_interior_collocation will reset the indexes, it should be called after removing points
+        # Generate re-sampled population P_s^i ~ U(Ω), size num_new
+        num_new = N_r - len(retained_points) # Compute number of new points to sample
         if num_new > 0:
             collocation_dataset.add_random_interior_collocation(num_new)
-        else:
-            new_points = np.empty((0, current_points.shape[1]))
-        
-        # Step 7: Merge P_{i+1} = P_r^i ∪ P_s^i
-        updated_points = np.vstack([retained_points, new_points])
+
+        # set replay buffer
         removed_points = current_points[~retain_mask]
-        return updated_points, removed_points
+        collocation_dataset.update_replay_buffer(removed_points)
+
+        return collocation_dataset

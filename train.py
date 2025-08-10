@@ -12,6 +12,7 @@ import copy
 
 def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=None, saveModel=True, adaptive_sampling_method=None):
     epochs = conf.epochs
+    optimizer.zero_grad()
     scaler = torch.cuda.amp.GradScaler()  # For mixed precision training
 
     batch_size = conf.batch_size if conf.batch_size != 'all' else len(dataset)
@@ -34,15 +35,21 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=
         dataloader_kwargs['persistent_workers'] = True
     
     trainLoader = DataLoader(dataset, **dataloader_kwargs)
-    
     for epoch in range(epochs):
         train_tqdm = tqdm(trainLoader, total=len(trainLoader))
+        if adaptive_sampling_method and (epoch + 1) % conf.adaptive_sampling.sampling_interval == 0:
+            residual_record = []
+            idx_record = []
+        else:
+            residual_record = None
+            idx_record = None
+
         for batch_idx, batch in enumerate(train_tqdm):
             train_tqdm.set_description(f'Epoch {epoch+1}/{epochs}')
             model.train()
             optimizer.zero_grad()
 
-            coords, known, point_type = batch
+            coords, known, point_type, idx = batch
             coords = coords.to(device, non_blocking=True)
             known = known.to(device, non_blocking=True)
             coords.requires_grad_(True)
@@ -50,11 +57,14 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=
             # Use mixed precision for faster training
             with torch.cuda.amp.autocast():
                 pred = model(coords)
-                total_residual, residual_message_dict = model.residual(coords, pred)
+                total_residual, collocation_residual, residual_message_dict = model.residual(coords, pred)
                 total_loss, loss_message_dict = loss_fn.compute(pred, known)
                 loss = total_loss + total_residual
-            
-            scaler.scale(loss).backward()
+            if residual_record is not None:
+                residual_record.append(collocation_residual.detach().cpu().numpy())
+                idx_record.append(idx.detach().cpu().numpy())
+
+            scaler.scale(loss).backward()          
             scaler.step(optimizer)
             scaler.update()
 
@@ -70,12 +80,24 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=
                     print(message)
         
         # Adaptive sampling step
-        if adaptive_sampling_method:
-            interval = conf.adaptive_sampling.sampling_interval
-            if (epoch + 1) % interval == 0:
-                print(adaptive_sampling_method)
-                updated_points, removed_points = adaptive_sampling_method.sample(total_residual, dataset)
-                    
+        if residual_record is not None:
+            adaptive_sampling_method.print()
+            # concatenate residuals and indices
+            ordered_residuals = np.concatenate(residual_record, axis=0)
+            ordered_idx = np.concatenate(idx_record, axis=0)
+            # rearrange residuals based on indices
+            ordered_residuals = ordered_residuals[np.argsort(ordered_idx)]
+            ordered_idx = np.sort(ordered_idx)
+            # preserve interior points
+            _, interior_idx = dataset.get_interior_dataset()
+            ordered_residuals = ordered_residuals[interior_idx]
+            ordered_idx = ordered_idx[interior_idx]
+
+            dataset = adaptive_sampling_method.sample(residuals=ordered_residuals, collocation_dataset=dataset)
+            # replay buffer
+            # set trainLoader with updated dataset
+            trainLoader = DataLoader(dataset, **dataloader_kwargs)
+
     if saveModel:
         torch.save(model.state_dict(), savePath + f'/final.pt')
     else:
@@ -87,7 +109,7 @@ def infer(model, infer_loader, device):
     all_preds = []
     with torch.no_grad():
         for batch_idx, batch in enumerate(infer_tqdm):
-            coords, _, _ = batch
+            coords, _, _, _ = batch
             coords = coords.to(device, non_blocking=True)
             coords.requires_grad_(True)
             
@@ -106,11 +128,12 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
     init_model = train(savePath, device, loss_fn, conf, init_dataset, model, optimizer, saveModel=False)
 
     # Pseudo-label of interior points
-    print('Infer & Pseudo-labeling initial interior points')
-    init_interior_dataset, init_interior_idx = point_cloud_collection.init_dataset.get_interior_dataset()
-    init_infer_loader = DataLoader(init_interior_dataset)
-    pseudo_labels = infer(init_model, init_infer_loader, device)
-    point_cloud_collection.init_dataset.save_pseudo_labels(pseudo_labels, init_interior_idx)
+    if conf.psuedo_labeling.use_pseudo_labels:
+        print('Infer & Pseudo-labeling initial interior points')
+        init_interior_dataset, init_interior_idx = point_cloud_collection.init_dataset.get_interior_dataset()
+        init_infer_loader = DataLoader(init_interior_dataset)
+        pseudo_labels = infer(init_model, init_infer_loader, device)
+        point_cloud_collection.init_dataset.save_pseudo_labels(pseudo_labels, init_interior_idx)
 
     # Adaptive sampling loop
     point_cloud_collection.add_branch_dataset(adaptive_method_list)
@@ -120,7 +143,8 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
         print(adaptive_method_list[i])
         branch_dataset = point_cloud_collection.branch_dataset[i]
         branch_model = point_cloud_collection.branch_model[i]
-        branch_model = train(savePath, device, loss_fn, conf, branch_dataset, branch_model, optimizer, saveModel=False, adaptive_sampling_method=adaptive_method_list[i])
+        branch_optimizer = optim.Adam(branch_model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)
+        branch_model = train(savePath, device, loss_fn, conf, branch_dataset, branch_model, branch_optimizer, saveModel=False, adaptive_sampling_method=adaptive_method_list[i])
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -144,7 +168,7 @@ if __name__ == '__main__':
 
     # Define adaptive sampling methods (adaptive_method_list)
     from util.evo_sampling import evolutionary_sampling
-    adaptive_method_list = [evolutionary_sampling, 'uncertainty', 'gradient', 'residual']
+    adaptive_method_list = [evolutionary_sampling(), 'uncertainty', 'gradient', 'residual']
     ######### USER INPUT END #########
 
     point_cloud_collection = pointCloudCollection(point_cloud, conf, device)

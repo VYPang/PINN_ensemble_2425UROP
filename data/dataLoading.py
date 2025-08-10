@@ -16,8 +16,9 @@ class collocation:
 
 # Intake point_cloud should be a 
 class pointCloudDataset(Dataset):
-    def __init__(self, coords, known_values, point_types, dataset_name=None):
+    def __init__(self, conf, coords, known_values, point_types, dataset_name=None):
         # Store data on CPU for DataLoader compatibility
+        self.conf = conf
         self.coords = torch.tensor(coords, dtype=torch.float32)
         self.known_values = torch.tensor(known_values, dtype=torch.float32)
         self.dataset_name = dataset_name
@@ -30,9 +31,24 @@ class pointCloudDataset(Dataset):
         else:
             self.point_types = np.array(point_types)
             
-        self.idx = np.arange(len(self.coords))
+        self.idex = np.arange(len(self.coords))
         self._create_domain_boundary()
         self.set_interior_dataset()
+    
+    def update_replay_buffer(self, removed_points):
+        if removed_points is None: # adaptive sampling method does not remove points
+            return
+        if self.conf.adaptive_sampling.replay_buffer.use_replay_buffer and len(removed_points) > 0:
+            # Add removed points to replay buffer
+            if not hasattr(self, 'replay_buffer'):
+                self.replay_buffer = removed_points
+            else:
+                self.replay_buffer = np.concatenate((self.replay_buffer, removed_points), axis=0)
+            # Limit replay buffer size
+            if len(self.replay_buffer) > self.conf.adaptive_sampling.replay_buffer.replay_buffer_size:
+                # randomly sample from replay buffer to maintain size
+                indices = np.random.choice(len(self.replay_buffer), self.conf.adaptive_sampling.replay_buffer.replay_buffer_size, replace=False)
+                self.replay_buffer = self.replay_buffer[indices]
 
     def _create_domain_boundary(self):
         """Create a polygon representing the domain boundary from boundary, inlet, and outlet points."""
@@ -98,7 +114,10 @@ class pointCloudDataset(Dataset):
         plt.savefig(f'{self.dataset_name}_domain_and_points.png')
 
     def add_random_interior_collocation(self, num_points):
-        """Add random interior collocation points using rejection sampling with adaptive bounds."""
+        """
+        Warning: USING THIS METHOD RESETS INDEXES.
+        Add random interior collocation points using rejection sampling with adaptive bounds.
+        """
         if not hasattr(self, 'domain_path') or self.domain_path is None:
             raise ValueError("Domain boundary not defined. Cannot add interior points.")
         
@@ -128,13 +147,13 @@ class pointCloudDataset(Dataset):
         # Add the points to the dataset (same as previous method)
         if len(new_interior_coords) > 0:
             new_coords = torch.tensor(new_interior_coords[:num_points], dtype=torch.float32)
-            new_values = torch.zeros((len(new_coords), self.known_values.shape[1]), dtype=torch.float32)
+            new_values = torch.full((len(new_coords), self.known_values.shape[1]), float('nan'))
             new_point_types = np.array(['interior'] * len(new_coords))
             
             self.coords = torch.cat([self.coords, new_coords], dim=0)
             self.known_values = torch.cat([self.known_values, new_values], dim=0)
             self.point_types = np.concatenate([self.point_types, new_point_types])
-            self.idx = np.arange(len(self.coords))
+            self.idex = np.arange(len(self.coords))
             self.set_interior_dataset()
             
             print(f"Added {len(new_coords)} random interior collocation points")
@@ -146,11 +165,12 @@ class pointCloudDataset(Dataset):
         interior_coords = self.coords[interior_mask]
         interior_known_values = self.known_values[interior_mask]
         interior_point_types = self.point_types[interior_mask]
-        self.interior_idx = self.idx[interior_mask]
+        self.interior_idx = self.idex[interior_mask]
         
         # Convert filtered data to proper format for interiorDataset
         if len(interior_coords) > 0:
             self.interior_dataset = interiorDataset(
+                self.conf,
                 interior_coords.cpu().numpy(), 
                 interior_known_values.cpu().numpy(), 
                 interior_point_types
@@ -158,10 +178,20 @@ class pointCloudDataset(Dataset):
         else:
             # Create empty dataset if no interior points found
             self.interior_dataset = interiorDataset(
+                self.conf,
                 np.empty((0, 2)), 
                 np.empty((0, 3)), 
                 np.array([])
             )
+    def remove_interior_dataset(self, removed_idx):
+        """
+        Warning: USING THIS METHOD RESETS INDEXES.
+        """
+        self.coords = self.coords[~np.isin(self.idex, removed_idx)]
+        self.known_values = self.known_values[~np.isin(self.idex, removed_idx)]
+        self.point_types = self.point_types[~np.isin(self.idex, removed_idx)]
+        self.idex = np.arange(len(self.coords))
+        self.set_interior_dataset()  # Update interior dataset after removing points
     
     def get_interior_dataset(self):
         return self.interior_dataset, self.interior_idx
@@ -175,7 +205,7 @@ class pointCloudDataset(Dataset):
         return len(self.coords)
     
     def __getitem__(self, idx):
-        return self.coords[idx], self.known_values[idx], self.point_types[idx]
+        return self.coords[idx], self.known_values[idx], self.point_types[idx], self.idex[idx]
 
     def check_inside_boundary(self, x, y): # Check if a point (x, y) is inside the domain boundary.
         if not hasattr(self, 'domain_path') or self.domain_path is None:
@@ -187,8 +217,8 @@ class pointCloudDataset(Dataset):
         return boundary_polygon_shapely.contains(point_shapely)
 
 class interiorDataset(pointCloudDataset):
-    def __init__(self, coords, known_values, point_types):
-        super().__init__(coords, known_values, point_types)
+    def __init__(self, conf, coords, known_values, point_types):
+        super().__init__(conf, coords, known_values, point_types)
     
     def set_interior_dataset(self): # Override to prevent setting interior dataset
         return
@@ -214,13 +244,14 @@ class pointCloudCollection:
         self.init_point_types = point_types
             
         # Dataset stores data on CPU, GPU transfer happens in DataLoader
-        self.init_dataset = pointCloudDataset(coords, known_values, point_types, dataset_name='initial')
+        self.init_dataset = pointCloudDataset(conf, coords, known_values, point_types, dataset_name='initial')
         self.branch_dataset = []
         self.ground_truth = torch.tensor(ground_truth, dtype=torch.float32, device=device)
 
     def add_branch_dataset(self, adaptive_method_list): # create new branches according to no. of adaptive methods
         for method in adaptive_method_list:
             branch_dataset = pointCloudDataset(
+                self.conf,
                 self.init_coords, 
                 self.init_known_values, 
                 self.init_point_types,
@@ -229,13 +260,8 @@ class pointCloudCollection:
             self.branch_dataset.append(branch_dataset)
 
     def add_random_interior_collocation_to_branch_datasets(self, num_points):
-        add_random_interior_collocation = self.conf.adaptive_sampling.add_random_interior_collocation
-        if add_random_interior_collocation:
-            # add to init dataset
-            self.init_dataset.add_random_interior_collocation(num_points)
-            # add to branch datasets
-            for branch in self.branch_dataset:
-                branch.add_random_interior_collocation(num_points)
+        for branch in self.branch_dataset:
+            branch.add_random_interior_collocation(num_points)
     
     def add_branch_model(self, original_model, initial_model):
         self.branch_model = []
