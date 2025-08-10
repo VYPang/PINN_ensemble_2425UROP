@@ -94,9 +94,8 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=
             ordered_idx = ordered_idx[interior_idx]
 
             dataset = adaptive_sampling_method.sample(residuals=ordered_residuals, collocation_dataset=dataset)
-            # replay buffer
-            # set trainLoader with updated dataset
-            trainLoader = DataLoader(dataset, **dataloader_kwargs)
+            dataset.add_random_from_replay_buffer() # add collocation from replay buffer
+            trainLoader = DataLoader(dataset, **dataloader_kwargs) # set trainLoader with updated dataset
 
     if saveModel:
         torch.save(model.state_dict(), savePath + f'/final.pt')
@@ -140,7 +139,7 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
     point_cloud_collection.add_random_interior_collocation_to_branch_datasets(conf.adaptive_sampling.add_random_interior_collocation)
     point_cloud_collection.add_branch_model(og_model, init_model)
     for i in range(len(adaptive_method_list)):
-        print(adaptive_method_list[i])
+        adaptive_method_list[i].print()
         branch_dataset = point_cloud_collection.branch_dataset[i]
         branch_model = point_cloud_collection.branch_model[i]
         branch_optimizer = optim.Adam(branch_model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)

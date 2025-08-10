@@ -21,6 +21,7 @@ class pointCloudDataset(Dataset):
         self.conf = conf
         self.coords = torch.tensor(coords, dtype=torch.float32)
         self.known_values = torch.tensor(known_values, dtype=torch.float32)
+        self.is_pseudo_label = torch.full((len(self.coords),), False, dtype=torch.bool)  # Track pseudo-label status
         self.dataset_name = dataset_name
         
         # Convert point_types to numpy array for proper integer indexing
@@ -35,6 +36,25 @@ class pointCloudDataset(Dataset):
         self._create_domain_boundary()
         self.set_interior_dataset()
     
+    def add_random_from_replay_buffer(self):
+        """
+        Warning: USING THIS METHOD RESETS INDEXES.
+        """
+        if self.conf.adaptive_sampling.replay_buffer.use_replay_buffer:
+            num_points = self.conf.adaptive_sampling.replay_buffer.add_num_points
+            if hasattr(self, 'replay_buffer') and len(self.replay_buffer) > 0:
+                # Randomly sample points from replay buffer
+                sampled_points = np.random.choice(len(self.replay_buffer), num_points, replace=False)
+                self.coords = torch.cat((self.coords, self.replay_buffer[sampled_points]), dim=0)
+                """
+                Known value would be improved in future to consider pseudo-labeling
+                """
+                known_values = torch.full((len(sampled_points), self.known_values.shape[1]), float('nan'))
+                self.known_values = torch.cat((self.known_values, known_values), dim=0)
+                self.point_types = np.concatenate((self.point_types, np.full(num_points, 'interior')))
+                self.idex = np.arange(len(self.coords))
+                self.set_interior_dataset()
+
     def update_replay_buffer(self, removed_points):
         if removed_points is None: # adaptive sampling method does not remove points
             return
@@ -199,6 +219,7 @@ class pointCloudDataset(Dataset):
     def save_pseudo_labels(self, pseudo_labels, idx):
         # Save pseudo labels to the known_values tensor at the specified indices
         self.known_values[idx] = torch.tensor(pseudo_labels, dtype=torch.float32)
+        self.is_pseudo_label[idx] = True
         self.set_interior_dataset()  # Update interior dataset after saving pseudo labels
 
     def __len__(self):
