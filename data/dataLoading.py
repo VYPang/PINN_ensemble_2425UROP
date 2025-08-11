@@ -16,12 +16,12 @@ class collocation:
 
 # Intake point_cloud should be a 
 class pointCloudDataset(Dataset):
-    def __init__(self, conf, coords, known_values, point_types, dataset_name=None):
+    def __init__(self, conf, coords, known_values, point_types, is_pseudo_label=None, dataset_name=None):
         # Store data on CPU for DataLoader compatibility
         self.conf = conf
         self.coords = torch.tensor(coords, dtype=torch.float32)
         self.known_values = torch.tensor(known_values, dtype=torch.float32)
-        self.is_pseudo_label = torch.full((len(self.coords),), False, dtype=torch.bool)  # Track pseudo-label status
+        self.is_pseudo_label = torch.full((len(self.coords),), False, dtype=torch.bool) if is_pseudo_label is None else torch.tensor(is_pseudo_label, dtype=torch.bool)
         self.dataset_name = dataset_name
         
         # Convert point_types to numpy array for proper integer indexing
@@ -44,31 +44,52 @@ class pointCloudDataset(Dataset):
             num_points = self.conf.adaptive_sampling.replay_buffer.add_num_points
             if hasattr(self, 'replay_buffer') and len(self.replay_buffer) > 0:
                 # Randomly sample points from replay buffer
-                sampled_points = np.random.choice(len(self.replay_buffer), num_points, replace=False)
-                self.coords = torch.cat((self.coords, self.replay_buffer[sampled_points]), dim=0)
-                """
-                Known value would be improved in future to consider pseudo-labeling
-                """
-                known_values = torch.full((len(sampled_points), self.known_values.shape[1]), float('nan'))
-                self.known_values = torch.cat((self.known_values, known_values), dim=0)
+                indices = torch.randperm(len(self.replay_buffer))[:num_points]
+                sampled_points = self.replay_buffer[indices]
+                sampled_is_pseudo_label = self.replay_buffer_is_pseudo_label[indices]
+                sampled_known_value = self.replay_buffer_known_value[indices]
+
+                # Update dataset with sampled points
+                self.coords = torch.cat((self.coords, sampled_points), dim=0)
+                self.known_values = torch.cat((self.known_values, sampled_known_value), dim=0)
+                self.is_pseudo_label = torch.cat((self.is_pseudo_label, sampled_is_pseudo_label), dim=0)
                 self.point_types = np.concatenate((self.point_types, np.full(num_points, 'interior')))
                 self.idex = np.arange(len(self.coords))
                 self.set_interior_dataset()
 
-    def update_replay_buffer(self, removed_points):
+    def update_replay_buffer(self, removed_points, removed_is_pseudo_label, removed_known_value):
         if removed_points is None: # adaptive sampling method does not remove points
             return
         if self.conf.adaptive_sampling.replay_buffer.use_replay_buffer and len(removed_points) > 0:
+            # Ensure removed_points is a torch tensor
+            if not isinstance(removed_points, torch.Tensor):
+                removed_points = torch.tensor(removed_points, dtype=torch.float32)
+            if not isinstance(removed_is_pseudo_label, torch.Tensor):
+                removed_is_pseudo_label = torch.tensor(removed_is_pseudo_label, dtype=torch.bool)
+            if not isinstance(removed_known_value, torch.Tensor):
+                removed_known_value = torch.tensor(removed_known_value, dtype=torch.float32)
+
             # Add removed points to replay buffer
             if not hasattr(self, 'replay_buffer'):
                 self.replay_buffer = removed_points
             else:
-                self.replay_buffer = np.concatenate((self.replay_buffer, removed_points), axis=0)
+                self.replay_buffer = torch.cat((self.replay_buffer, removed_points), dim=0)
+            if not hasattr(self, 'replay_buffer_is_pseudo_label'):
+                self.replay_buffer_is_pseudo_label = removed_is_pseudo_label
+            else:
+                self.replay_buffer_is_pseudo_label = torch.cat((self.replay_buffer_is_pseudo_label, removed_is_pseudo_label), dim=0)
+            if not hasattr(self, 'replay_buffer_known_value'):
+                self.replay_buffer_known_value = removed_known_value
+            else:
+                self.replay_buffer_known_value = torch.cat((self.replay_buffer_known_value, removed_known_value), dim=0)
+            
             # Limit replay buffer size
             if len(self.replay_buffer) > self.conf.adaptive_sampling.replay_buffer.replay_buffer_size:
                 # randomly sample from replay buffer to maintain size
-                indices = np.random.choice(len(self.replay_buffer), self.conf.adaptive_sampling.replay_buffer.replay_buffer_size, replace=False)
+                indices = torch.randperm(len(self.replay_buffer))[:self.conf.adaptive_sampling.replay_buffer.replay_buffer_size]
                 self.replay_buffer = self.replay_buffer[indices]
+                self.replay_buffer_is_pseudo_label = self.replay_buffer_is_pseudo_label[indices]
+                self.replay_buffer_known_value = self.replay_buffer_known_value[indices]
 
     def _create_domain_boundary(self):
         """Create a polygon representing the domain boundary from boundary, inlet, and outlet points."""
@@ -169,10 +190,12 @@ class pointCloudDataset(Dataset):
             new_coords = torch.tensor(new_interior_coords[:num_points], dtype=torch.float32)
             new_values = torch.full((len(new_coords), self.known_values.shape[1]), float('nan'))
             new_point_types = np.array(['interior'] * len(new_coords))
+            new_psuedo_label = torch.full((len(new_coords),), False, dtype=torch.bool)
             
             self.coords = torch.cat([self.coords, new_coords], dim=0)
             self.known_values = torch.cat([self.known_values, new_values], dim=0)
             self.point_types = np.concatenate([self.point_types, new_point_types])
+            self.is_pseudo_label = torch.cat([self.is_pseudo_label, new_psuedo_label])
             self.idex = np.arange(len(self.coords))
             self.set_interior_dataset()
             
@@ -185,6 +208,7 @@ class pointCloudDataset(Dataset):
         interior_coords = self.coords[interior_mask]
         interior_known_values = self.known_values[interior_mask]
         interior_point_types = self.point_types[interior_mask]
+        interior_pseudo_label = self.is_pseudo_label[interior_mask]
         self.interior_idx = self.idex[interior_mask]
         
         # Convert filtered data to proper format for interiorDataset
@@ -193,7 +217,8 @@ class pointCloudDataset(Dataset):
                 self.conf,
                 interior_coords.cpu().numpy(), 
                 interior_known_values.cpu().numpy(), 
-                interior_point_types
+                interior_point_types,
+                is_pseudo_label=interior_pseudo_label.cpu().numpy()
             )
         else:
             # Create empty dataset if no interior points found
@@ -201,7 +226,8 @@ class pointCloudDataset(Dataset):
                 self.conf,
                 np.empty((0, 2)), 
                 np.empty((0, 3)), 
-                np.array([])
+                np.array([]),
+                is_pseudo_label=np.empty((0,), dtype=bool)
             )
     def remove_interior_dataset(self, removed_idx):
         """
@@ -210,6 +236,7 @@ class pointCloudDataset(Dataset):
         self.coords = self.coords[~np.isin(self.idex, removed_idx)]
         self.known_values = self.known_values[~np.isin(self.idex, removed_idx)]
         self.point_types = self.point_types[~np.isin(self.idex, removed_idx)]
+        self.is_pseudo_label = self.is_pseudo_label[~np.isin(self.idex, removed_idx)]
         self.idex = np.arange(len(self.coords))
         self.set_interior_dataset()  # Update interior dataset after removing points
     
@@ -238,8 +265,8 @@ class pointCloudDataset(Dataset):
         return boundary_polygon_shapely.contains(point_shapely)
 
 class interiorDataset(pointCloudDataset):
-    def __init__(self, conf, coords, known_values, point_types):
-        super().__init__(conf, coords, known_values, point_types)
+    def __init__(self, conf, coords, known_values, point_types, is_pseudo_label=None):
+        super().__init__(conf, coords, known_values, point_types, is_pseudo_label=is_pseudo_label)
     
     def set_interior_dataset(self): # Override to prevent setting interior dataset
         return
@@ -276,6 +303,7 @@ class pointCloudCollection:
                 self.init_coords, 
                 self.init_known_values, 
                 self.init_point_types,
+                self.init_dataset.is_pseudo_label,
                 dataset_name=f'branch_{method}'
             )
             self.branch_dataset.append(branch_dataset)
