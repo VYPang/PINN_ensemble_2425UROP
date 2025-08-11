@@ -34,8 +34,18 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, epochs, va
         dataloader_kwargs['persistent_workers'] = True
     
     trainLoader = DataLoader(dataset, **dataloader_kwargs)
+    
+    # Get tqdm setting from config (default to True for backward compatibility)
+    enable_tqdm = getattr(conf, 'enable_train_tqdm', True)
+    
     for epoch in range(epochs):
-        train_tqdm = tqdm(trainLoader, total=len(trainLoader))
+        if enable_tqdm:
+            train_tqdm = tqdm(trainLoader, total=len(trainLoader))
+            train_iterator = train_tqdm
+        else:
+            train_iterator = trainLoader
+            train_tqdm = None
+            
         if adaptive_sampling_method and (epoch + 1) % conf.adaptive_sampling.sampling_interval == 0:
             residual_record = []
             idx_record = []
@@ -43,8 +53,9 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, epochs, va
             residual_record = None
             idx_record = None
 
-        for batch_idx, batch in enumerate(train_tqdm):
-            train_tqdm.set_description(f'Epoch {epoch+1}/{epochs}')
+        for batch_idx, batch in enumerate(train_iterator):
+            if train_tqdm is not None:
+                train_tqdm.set_description(f'Epoch {epoch+1}/{epochs}')
             model.train()
             optimizer.zero_grad()
 
@@ -101,6 +112,10 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, epochs, va
                         message += f'{key}: {value:.4f} '
                 if len(message) > 0:
                     print(message)
+            
+            # Show progress when tqdm is disabled
+            elif not enable_tqdm and epoch % 500 == 0 and batch_idx == 0:
+                print(f'Training progress: Epoch {epoch}/{epochs} ({100*epoch/epochs:.1f}%)')
         
         # Adaptive sampling step
         if residual_record is not None:
