@@ -145,6 +145,36 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
         branch_optimizer = optim.Adam(branch_model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)
         branch_model = train(savePath, device, loss_fn, conf, branch_dataset, branch_model, branch_optimizer, saveModel=False, adaptive_sampling_method=adaptive_method_list[i])
 
+def semiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, adaptive_method):
+    # Create an independent copy of the original model
+    og_model = copy.deepcopy(model)
+    
+    # Initial training: provide pseudo-labels & initial model
+    print('Initial training')
+    init_dataset = point_cloud_collection.init_dataset
+    init_model = train(savePath, device, loss_fn, conf, init_dataset, model, optimizer, saveModel=False)
+
+    # Pseudo-label of interior points
+    if conf.psuedo_labeling.use_pseudo_labels:
+        print('Infer & Pseudo-labeling initial interior points')
+        init_interior_dataset, init_interior_idx = point_cloud_collection.init_dataset.get_interior_dataset()
+        init_infer_loader = DataLoader(init_interior_dataset)
+        pseudo_labels = infer(init_model, init_infer_loader, device)
+        point_cloud_collection.init_dataset.save_pseudo_labels(pseudo_labels, init_interior_idx)
+
+    # Semi-supervised learning loop
+    adaptive_method = adaptive_method if isinstance(adaptive_method, list) else [adaptive_method]
+    point_cloud_collection.add_branch_dataset(adaptive_method)
+    point_cloud_collection.add_random_interior_collocation_to_branch_datasets(conf.adaptive_sampling.add_random_interior_collocation)
+    point_cloud_collection.add_branch_model(og_model, init_model)
+
+    # Adaptive sampling loop
+    adaptive_method = adaptive_method[0]  # Use the first method for semi-supervised learning
+    dataset = point_cloud_collection.branch_dataset[0]
+    model = point_cloud_collection.branch_model[0]
+    optimizer = optim.Adam(model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)
+    train(savePath, device, loss_fn, conf, dataset, model, optimizer, saveModel=True, adaptive_sampling_method=adaptive_method)
+
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ######### USER INPUT #########
@@ -186,4 +216,5 @@ if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True  # Use TF32 for faster matrix operations
     torch.backends.cudnn.allow_tf32 = True
     
-    votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, adaptive_method_list)
+    semiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, evolutionary_sampling())
+    # votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, adaptive_method_list)
