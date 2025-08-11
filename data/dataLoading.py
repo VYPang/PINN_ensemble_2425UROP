@@ -253,7 +253,7 @@ class pointCloudDataset(Dataset):
         return len(self.coords)
     
     def __getitem__(self, idx):
-        return self.coords[idx], self.known_values[idx], self.point_types[idx], self.idex[idx]
+        return self.coords[idx], self.known_values[idx], self.is_pseudo_label[idx], self.idex[idx]
 
     def check_inside_boundary(self, x, y): # Check if a point (x, y) is inside the domain boundary.
         if not hasattr(self, 'domain_path') or self.domain_path is None:
@@ -300,10 +300,10 @@ class pointCloudCollection:
         for method in adaptive_method_list:
             branch_dataset = pointCloudDataset(
                 self.conf,
-                self.init_coords, 
-                self.init_known_values, 
-                self.init_point_types,
-                self.init_dataset.is_pseudo_label,
+                self.init_dataset.coords.numpy(), 
+                self.init_dataset.known_values.numpy(),
+                self.init_dataset.point_types,
+                is_pseudo_label=self.init_dataset.is_pseudo_label.numpy(),
                 dataset_name=f'branch_{method}'
             )
             self.branch_dataset.append(branch_dataset)

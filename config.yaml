@@ -1,21 +1,22 @@
 batch_size: 16384  # Use a reasonable batch size instead of 'all'
 lr: 0.001
 momentum: 0.5
-epochs: 100 # 100000
+init_epochs: 800 # 100000
 val_split: 0.2
 weight_decay: 0.0001
 num_workers: 8  # Set to 0 for Windows to avoid multiprocessing issues
 pin_memory: true  # Disable pin_memory for compatibility
 prefetch_factor: 4  # Prefetch batches
 
-psuedo_labeling:
+pseudo_labeling:
   use_pseudo_labels: true  # Enable pseudo-labeling (false for debug purpose)
-  pseudo_label_threshold: 0.5  # Threshold for pseudo-labeling
-  pseudo_label_weight: 0.1  # Weight for pseudo-label loss
+  pseudo_loss_decay_rate: 0.008 # exp(rate * epoch) (set rate to 0 for no decay)
+  pseudo_label_weight: 1  # Weight for pseudo-label loss
 
 adaptive_sampling:
+  epochs: 5000
   add_random_interior_collocation: 10000 # Number of random interior collocation points to add
-  sampling_interval: 10 # Interval in epochs for adaptive sampling
+  sampling_interval: 200 # Interval in epochs for adaptive sampling
   initiate_new_model: false # Whether to initiate a new model for each branch
   replay_buffer: # Used if collocation are removed in adaptive sampling
     use_replay_buffer: true # Enable replay buffer for adaptive sampling

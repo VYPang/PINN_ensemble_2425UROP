@@ -10,8 +10,7 @@ import numpy as np
 import os
 import copy
 
-def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=None, saveModel=True, adaptive_sampling_method=None):
-    epochs = conf.epochs
+def train(savePath, device, loss_fn, conf, dataset, model, optimizer, epochs, valLoader=None, saveModel=True, adaptive_sampling_method=None):
     optimizer.zero_grad()
     scaler = torch.cuda.amp.GradScaler()  # For mixed precision training
 
@@ -49,17 +48,38 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=
             model.train()
             optimizer.zero_grad()
 
-            coords, known, point_type, idx = batch
+            coords, known, is_pseudo_label, idx = batch
             coords = coords.to(device, non_blocking=True)
             known = known.to(device, non_blocking=True)
+            is_pseudo_label = is_pseudo_label.to(device, non_blocking=True)
             coords.requires_grad_(True)
             
             # Use mixed precision for faster training
             with torch.cuda.amp.autocast():
                 pred = model(coords)
                 total_residual, collocation_residual, residual_message_dict = model.residual(coords, pred)
-                total_loss, loss_message_dict = loss_fn.compute(pred, known)
-                loss = total_loss + total_residual
+                # extract points that are not pseudo-labeled
+                ground_known = known[~is_pseudo_label]
+                ground_pred = pred[~is_pseudo_label]
+                ground_loss, ground_loss_message_dict = loss_fn.compute(ground_pred, ground_known)
+                # extract points that are pseudo-labeled
+                pseudo_known = known[is_pseudo_label]
+                pseudo_pred = pred[is_pseudo_label]
+                if len(pseudo_known) > 0:
+                    pseudo_loss, pseudo_loss_message_dict = loss_fn.compute(pseudo_pred, pseudo_known)
+                    # Apply exponential decay coefficient to pseudo_loss
+                    decay_rate = conf.pseudo_labeling.pseudo_loss_decay_rate
+                    pseudo_weight = conf.pseudo_labeling.pseudo_label_weight
+                    pseudo_decay_coeff = torch.exp(torch.tensor(-decay_rate * epoch, device=device))
+                    pseudo_loss = pseudo_decay_coeff * pseudo_loss * pseudo_weight
+                    # Update message dict to include decay coefficient
+                    if pseudo_loss_message_dict:
+                        pseudo_loss_message_dict = {f"pseudo_{k}": v for k, v in pseudo_loss_message_dict.items()}
+                        pseudo_loss_message_dict['pseudo_decay_coeff'] = pseudo_decay_coeff.item()
+                else:
+                    pseudo_loss = torch.tensor(0.0, device=device)
+                    pseudo_loss_message_dict = {}
+                loss = ground_loss + total_residual + pseudo_loss
             if residual_record is not None:
                 residual_record.append(collocation_residual.detach().cpu().numpy())
                 idx_record.append(idx.detach().cpu().numpy())
@@ -73,8 +93,11 @@ def train(savePath, device, loss_fn, conf, dataset, model, optimizer, valLoader=
                 if residual_message_dict:
                     for key, value in residual_message_dict.items():
                         message += f'{key}: {value:.4f} '
-                if loss_message_dict:
-                    for key, value in loss_message_dict.items():
+                if ground_loss_message_dict:
+                    for key, value in ground_loss_message_dict.items():
+                        message += f'{key}: {value:.4f} '
+                if pseudo_loss_message_dict:
+                    for key, value in pseudo_loss_message_dict.items():
                         message += f'{key}: {value:.4f} '
                 if len(message) > 0:
                     print(message)
@@ -124,10 +147,10 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
     # Initial training: provide pseudo-labels & initial model
     print('Initial training')
     init_dataset = point_cloud_collection.init_dataset
-    init_model = train(savePath, device, loss_fn, conf, init_dataset, model, optimizer, saveModel=False)
+    init_model = train(savePath, device, loss_fn, conf, init_dataset, model, optimizer, conf.init_epochs, saveModel=False)
 
     # Pseudo-label of interior points
-    if conf.psuedo_labeling.use_pseudo_labels:
+    if conf.pseudo_labeling.use_pseudo_labels:
         print('Infer & Pseudo-labeling initial interior points')
         init_interior_dataset, init_interior_idx = point_cloud_collection.init_dataset.get_interior_dataset()
         init_infer_loader = DataLoader(init_interior_dataset)
@@ -138,12 +161,13 @@ def votedSemiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_col
     point_cloud_collection.add_branch_dataset(adaptive_method_list)
     point_cloud_collection.add_random_interior_collocation_to_branch_datasets(conf.adaptive_sampling.add_random_interior_collocation)
     point_cloud_collection.add_branch_model(og_model, init_model)
+    branch_epochs = conf.adaptive_sampling.epochs
     for i in range(len(adaptive_method_list)):
         adaptive_method_list[i].print()
         branch_dataset = point_cloud_collection.branch_dataset[i]
         branch_model = point_cloud_collection.branch_model[i]
         branch_optimizer = optim.Adam(branch_model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)
-        branch_model = train(savePath, device, loss_fn, conf, branch_dataset, branch_model, branch_optimizer, saveModel=False, adaptive_sampling_method=adaptive_method_list[i])
+        branch_model = train(savePath, device, loss_fn, conf, branch_dataset, branch_model, branch_optimizer, branch_epochs, saveModel=False, adaptive_sampling_method=adaptive_method_list[i])
 
 def semiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collection, savePath, device, adaptive_method):
     # Create an independent copy of the original model
@@ -152,10 +176,10 @@ def semiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collecti
     # Initial training: provide pseudo-labels & initial model
     print('Initial training')
     init_dataset = point_cloud_collection.init_dataset
-    init_model = train(savePath, device, loss_fn, conf, init_dataset, model, optimizer, saveModel=False)
+    init_model = train(savePath, device, loss_fn, conf, init_dataset, model, optimizer, conf.init_epochs, saveModel=False)
 
     # Pseudo-label of interior points
-    if conf.psuedo_labeling.use_pseudo_labels:
+    if conf.pseudo_labeling.use_pseudo_labels:
         print('Infer & Pseudo-labeling initial interior points')
         init_interior_dataset, init_interior_idx = point_cloud_collection.init_dataset.get_interior_dataset()
         init_infer_loader = DataLoader(init_interior_dataset)
@@ -170,10 +194,11 @@ def semiSupervisedLearning(conf, model, optimizer, loss_fn, point_cloud_collecti
 
     # Adaptive sampling loop
     adaptive_method = adaptive_method[0]  # Use the first method for semi-supervised learning
+    adaptive_sampling_epochs = conf.adaptive_sampling.epochs
     dataset = point_cloud_collection.branch_dataset[0]
     model = point_cloud_collection.branch_model[0]
     optimizer = optim.Adam(model.parameters(), lr=conf.lr, weight_decay=conf.weight_decay)
-    train(savePath, device, loss_fn, conf, dataset, model, optimizer, saveModel=True, adaptive_sampling_method=adaptive_method)
+    train(savePath, device, loss_fn, conf, dataset, model, optimizer, adaptive_sampling_epochs, saveModel=True, adaptive_sampling_method=adaptive_method)
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
